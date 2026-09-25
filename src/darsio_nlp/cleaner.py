@@ -110,7 +110,7 @@ def remove_noise_lines(text: str, min_chars: int = 3) -> str:
     return "\n".join(result)
 
 
-def remove_repeated_lines(text: str, min_occurrences: int = 3) -> str:
+def remove_repeated_lines(text: str, min_occurrences: int = 2) -> str:
     """
     Remove lines that repeat across multiple pages (headers/footers).
     """
@@ -273,11 +273,11 @@ def clean_persian_text(
         text = remove_noise_lines(text, min_chars=3)
 
         # 12. Remove repeated headers/footers
-        text = remove_repeated_lines(text, min_occurrences=3)
+        text = remove_repeated_lines(text, min_occurrences=2)
 
         # 13. Aggressive OCR cleaning if needed
         if aggressive_ocr_clean:
-            text = clean_ocr_text(text, min_persian_per_line=5)
+            text = clean_ocr_text(text, min_persian_per_line=4)
 
     return text.strip()
 

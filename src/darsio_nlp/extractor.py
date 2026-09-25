@@ -114,6 +114,170 @@ def _preprocess_image(image):
 # Method 2: OCR (image-based PDFs)
 # ============================================================
 
+
+def _is_page_valid(text: str) -> tuple[bool, str]:
+    """
+    Check if OCR page has meaningful Persian content.
+
+    Returns:
+        (is_valid, reason)
+    """
+    import re
+
+    if not text or len(text.strip()) < 50:
+        return False, "too little text"
+
+    # Count meaningful Persian words (3+ chars)
+    persian_words = re.findall(
+        r"[ابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیآأإئءۀ]{3,}",
+        text,
+    )
+
+    if len(persian_words) < 10:
+        return False, f"only {len(persian_words)} meaningful words"
+
+    # Ratio of meaningful words to total tokens
+    total_tokens = text.split()
+    if len(total_tokens) > 0:
+        word_ratio = len(persian_words) / len(total_tokens)
+        if word_ratio < 0.3:
+            return False, f"low word ratio ({word_ratio:.1%})"
+
+    return True, "valid"
+
+
+def _detect_ocr_language(text: str) -> tuple[str, str]:
+    """
+    Detect the best OCR language based on text content.
+
+    Analyzes the ratio of Persian vs Latin characters to decide:
+    - 'fas' if text is predominantly Persian
+    - 'fas+eng' if text is mixed
+    - 'eng' if text is predominantly English
+
+    Args:
+        text: Sample text (usually from fitz)
+
+    Returns:
+        (lang, reason) - language code and explanation
+    """
+    import re
+
+    if not text or len(text.strip()) < 20:
+        return "fas+eng", "not enough text to analyze, defaulting to fas+eng"
+
+    # Count Persian letters
+    persian_chars = len(re.findall(r"[\u0600-\u06FF]", text))
+
+    # Count Latin letters
+    latin_chars = len(re.findall(r"[A-Za-z]", text))
+
+    total_letters = persian_chars + latin_chars
+    if total_letters == 0:
+        return "fas+eng", "no letters found, defaulting to fas+eng"
+
+    persian_ratio = persian_chars / total_letters
+    latin_ratio = latin_chars / total_letters
+
+    # Count Latin words (3+ letters, real words)
+    latin_words = re.findall(r"[A-Za-z]{3,}", text)
+    latin_word_count = len(latin_words)
+
+    # Decision logic
+    if persian_ratio > 0.85:
+        return "fas", f"predominantly Persian ({persian_ratio:.1%})"
+    elif latin_ratio > 0.5:
+        return "eng", f"predominantly English ({latin_ratio:.1%})"
+    elif persian_ratio > 0.5:
+        return "fas+eng", (
+            f"mixed content (Persian: {persian_ratio:.1%}, "
+            f"Latin: {latin_ratio:.1%}, Latin words: {latin_word_count})"
+        )
+    else:
+        return "fas+eng", f"mixed content (Persian: {persian_ratio:.1%})"
+
+
+def _detect_language_from_pdf(pdf_path: str, sample_page: int = 1) -> tuple[str, str]:
+    """
+    Detect OCR language by sampling a page from the PDF.
+
+    More reliable than analyzing garbled fitz output.
+
+    Args:
+        pdf_path: Path to PDF
+        sample_page: Page number to sample (1-indexed)
+
+    Returns:
+        (lang, reason)
+    """
+    import re
+
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+
+        # Convert just one page
+        images = convert_from_path(
+            pdf_path,
+            dpi=200,
+            first_page=sample_page,
+            last_page=sample_page,
+        )
+
+        if not images:
+            return "fas+eng", "could not extract sample page"
+
+        # Quick OCR with both languages to see which fits better
+        sample_text = pytesseract.image_to_string(
+            images[0],
+            lang="fas+eng",
+            config="--oem 3 --psm 4",
+        )
+
+        if not sample_text or len(sample_text.strip()) < 20:
+            return "fas+eng", "sample page has too little text"
+
+        # Analyze
+        persian_chars = len(re.findall(r"[\u0600-\u06FF]", sample_text))
+        latin_chars = len(re.findall(r"[A-Za-z]", sample_text))
+        total = persian_chars + latin_chars
+
+        if total == 0:
+            return "fas+eng", "no letters detected"
+
+        persian_ratio = persian_chars / total
+        latin_ratio = latin_chars / total
+
+        if persian_ratio > 0.7:
+            return "fas", f"sample page mostly Persian ({persian_ratio:.1%})"
+        elif latin_ratio > 0.7:
+            return "eng", f"sample page mostly English ({latin_ratio:.1%})"
+        else:
+            return "fas+eng", (
+                f"sample page mixed "
+                f"(Persian: {persian_ratio:.1%}, Latin: {latin_ratio:.1%})"
+            )
+    except Exception as e:
+        return "fas+eng", f"detection failed: {e}"
+
+
+def _trim_ocr_result(text: str, lang: str) -> str:
+    """
+    Post-process OCR result based on detected language.
+
+    If lang='fas', removes isolated Latin characters (OCR noise).
+    If lang='fas+eng', keeps everything.
+    """
+    import re
+
+    if lang == "fas":
+        # Remove isolated Latin characters (2 chars or less)
+        text = re.sub(r"(?<!\w)[A-Za-z]{1,2}(?!\w)", "", text)
+        # Clean up double spaces
+        text = re.sub(r"\s+", " ", text)
+
+    return text
+
 def _extract_with_ocr(
     pdf_path: str,
     dpi: int = 300,
@@ -121,17 +285,19 @@ def _extract_with_ocr(
     max_pages: int | None = None,
     start_page: int = 1,
     preprocess: bool = True,
+    skip_pages: list[int] | None = None,
 ) -> tuple[str, int, list[str]]:
     """
     Extract text using OCR (Tesseract).
 
     Args:
         pdf_path: Path to PDF
-        dpi: Image resolution (300 standard, 400+ for low-quality)
-        lang: Tesseract language code ('fas' for Persian)
+        dpi: Image resolution
+        lang: Tesseract language code
         max_pages: Limit number of pages (None = all)
         start_page: First page to process (1-indexed)
         preprocess: Apply image preprocessing before OCR
+        skip_pages: List of page numbers to skip
 
     Returns:
         (text, pages_processed, warnings)
@@ -141,6 +307,7 @@ def _extract_with_ocr(
 
     warnings = []
     pages_text = []
+    skip_pages = skip_pages or []
 
     # Step 1: Convert PDF pages to images
     try:
@@ -156,12 +323,15 @@ def _extract_with_ocr(
     pages_processed = len(images)
 
     # Tesseract config
-    # --oem 3: default LSTM engine
-    # --psm 4: single column of text of variable sizes (good for books)
     custom_config = r"--oem 3 --psm 4"
 
     # Step 2: OCR each image
     for idx, image in enumerate(images, start=start_page):
+        # Skip manually specified pages
+        if idx in skip_pages:
+            warnings.append(f"Skipped page {idx}: user-specified")
+            continue
+
         try:
             # Preprocess if requested
             if preprocess:
@@ -174,14 +344,12 @@ def _extract_with_ocr(
                 lang=lang,
                 config=custom_config,
             )
+            text = _trim_ocr_result(text, lang)
 
-            # Filter out pages with too little Persian content
-            page_persian_ratio = persian_ratio(text)
-            if page_persian_ratio < 0.3:
-                warnings.append(
-                    f"Skipped page {idx}: low Persian ratio "
-                    f"({page_persian_ratio:.1%})"
-                )
+            # Validate page content
+            is_valid, reason = _is_page_valid(text)
+            if not is_valid:
+                warnings.append(f"Skipped page {idx}: {reason}")
                 continue
 
             pages_text.append(f"\n===== Page {idx} =====\n\n{text}")
@@ -241,6 +409,7 @@ def extract_from_pdf(
     ocr_max_pages: int | None = None,
     ocr_preprocess: bool = True,
     aggressive_ocr_clean: bool = False, 
+    skip_pages: list[int] | None = None,
 ) -> ExtractionResult:
     """
     Extract text from a PDF with automatic method detection.
@@ -278,17 +447,31 @@ def extract_from_pdf(
     method: ExtractionMethod = "fitz"
     ocr_chars = 0
     ocr_pages_processed = 0
+    ocr_lang = None          # ← جدید
+    lang_reason = None 
 
     if needs_ocr:
         warnings.append(f"OCR suggested: {reason}")
 
         if use_ocr_if_needed:
+            # Choose detection method based on fitz quality
+            if fitz_p_ratio > 0.1:
+                # fitz has some Persian → fast method
+                ocr_lang, lang_reason = _detect_ocr_language(fitz_raw_text)
+            else:
+                # fitz is garbage → reliable image-based method
+                ocr_lang, lang_reason = _detect_language_from_pdf(pdf_path)
+            
+            warnings.append(f"OCR language: '{ocr_lang}' ({lang_reason})")
+
             try:
                 ocr_text, ocr_pages_processed, ocr_warnings = _extract_with_ocr(
                     pdf_path,
                     dpi=ocr_dpi,
+                    lang=ocr_lang,   # ← اینجا از lang تشخیص‌داده‌شده استفاده کن
                     max_pages=ocr_max_pages,
                     preprocess=ocr_preprocess,
+                    skip_pages=skip_pages,
                 )
                 warnings.extend(ocr_warnings)
 
@@ -348,6 +531,10 @@ def extract_from_pdf(
     stats["final_raw_chars"] = len(raw_text)
     if method == "ocr":
         stats["ocr_pages_processed"] = ocr_pages_processed
+
+    if ocr_lang:
+        stats["ocr_lang"] = ocr_lang
+        stats["ocr_lang_reason"] = lang_reason
 
     return ExtractionResult(
         pdf_path=pdf_path,
